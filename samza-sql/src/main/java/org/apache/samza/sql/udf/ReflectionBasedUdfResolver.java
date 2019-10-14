@@ -16,8 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-
-package org.apache.samza.sql.impl;
+package org.apache.samza.sql.udf;
 
 import java.lang.reflect.Method;
 import java.util.ArrayList;
@@ -26,9 +25,7 @@ import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Properties;
-import java.util.stream.Collectors;
-import org.apache.commons.lang.StringUtils;
+import java.util.Set;
 import org.apache.samza.SamzaException;
 import org.apache.samza.config.Config;
 import org.apache.samza.sql.interfaces.UdfMetadata;
@@ -36,63 +33,40 @@ import org.apache.samza.sql.interfaces.UdfResolver;
 import org.apache.samza.sql.schema.SamzaSqlFieldType;
 import org.apache.samza.sql.udfs.SamzaSqlUdf;
 import org.apache.samza.sql.udfs.SamzaSqlUdfMethod;
-import org.apache.samza.sql.udfs.ScalarUdf;
+import org.reflections.Reflections;
+import org.reflections.util.ConfigurationBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+public class ReflectionBasedUdfResolver implements UdfResolver {
 
-/**
- * Udf resolver that uses static config to return the UDFs present in the Samza SQL application
- * All the UDF classes are provided to this factory as a comma separated list of values for the config named
- * "udfClasses".
- * This factory loads all the udf classes that are configured, performs the validation to ensure that they extend
- * {@link ScalarUdf} and implement the method named "execute"
- */
-public class ConfigBasedUdfResolver implements UdfResolver {
+  private static final Logger LOG = LoggerFactory.getLogger(ReflectionBasedUdfResolver.class);
 
-  private static final Logger LOG = LoggerFactory.getLogger(ConfigBasedUdfResolver.class);
-  public static final String CFG_UDF_CLASSES = "udfClasses";
+  private static final String CONFIG_PACKAGE_PREFIX = "samza.sql.udf.resolver.package.prefix";
 
-  private final ArrayList<UdfMetadata> udfs;
+  private final List<UdfMetadata> udfs  = new ArrayList<>();
 
-  public ConfigBasedUdfResolver(Properties config, Config udfConfig) {
-    List<String> udfClasses = Arrays.stream(config.getProperty(CFG_UDF_CLASSES, "").split(","))
-        .filter(StringUtils::isNotBlank)
-        .collect(Collectors.toList());
-    udfs = new ArrayList<>();
-    Class<?> udfClass;
-    for (String udfClassName : udfClasses) {
-      try {
-        udfClass = Class.forName(udfClassName);
-      } catch (ClassNotFoundException e) {
-        String msg = String.format("Couldn't load the udf class %s", udfClassName);
-        LOG.error(msg, e);
-        throw new SamzaException(msg, e);
-      }
+  public ReflectionBasedUdfResolver(Config udfConfig) {
+    // Within Linkedin this value will be set to ["com.linkedin.samza", "org.apache.samza", "com.linkedin.samza.sql.shade.prefix"] through configuration.
+    String samzaSqlUdfPackagePrefixes = udfConfig.getOrDefault(CONFIG_PACKAGE_PREFIX, "org.apache.samza");
 
-      if (!ScalarUdf.class.isAssignableFrom(udfClass)) {
-        String msg = String.format("Udf class %s is not extended from %s", udfClassName, ScalarUdf.class.getName());
-        LOG.error(msg);
-        throw new SamzaException(msg);
-      }
+    ConfigurationBuilder configurationBuilder = new ConfigurationBuilder();
+    configurationBuilder.forPackages(samzaSqlUdfPackagePrefixes.split(","));
+    configurationBuilder.addClassLoader(Thread.currentThread().getContextClassLoader());
 
-      SamzaSqlUdf sqlUdf;
+    Reflections reflections = new Reflections(configurationBuilder);
+    Set<Class<?>> typesAnnotatedWithSamzaSqlUdf = reflections.getTypesAnnotatedWith(SamzaSqlUdf.class);
+
+    for (Class<?> udfClass : typesAnnotatedWithSamzaSqlUdf) {
+      SamzaSqlUdf sqlUdf = udfClass.getAnnotation(SamzaSqlUdf.class);
       Map<SamzaSqlUdfMethod, Method> udfMethods = new HashMap<>();
-      SamzaSqlUdfMethod sqlUdfMethod = null;
 
-      sqlUdf = udfClass.getAnnotation(SamzaSqlUdf.class);
       Method[] methods = udfClass.getMethods();
       for (Method method : methods) {
-        sqlUdfMethod = method.getAnnotation(SamzaSqlUdfMethod.class);
+        SamzaSqlUdfMethod sqlUdfMethod = method.getAnnotation(SamzaSqlUdfMethod.class);
         if (sqlUdfMethod != null) {
           udfMethods.put(sqlUdfMethod, method);
         }
-      }
-
-      if (sqlUdf == null) {
-        String msg = String.format("UdfClass %s is not annotated with SamzaSqlUdf", udfClass);
-        LOG.error(msg);
-        throw new SamzaException(msg);
       }
 
       if (udfMethods.isEmpty()) {
@@ -105,6 +79,7 @@ public class ConfigBasedUdfResolver implements UdfResolver {
         String udfName = sqlUdf.name();
         for (Map.Entry<SamzaSqlUdfMethod, Method> udfMethod : udfMethods.entrySet()) {
           List<SamzaSqlFieldType> params = Arrays.asList(udfMethod.getKey().params());
+          LOG.info("Adding the udfName: {}, params: {}, method: {}.", udfName, params, udfMethod.getKey());
           udfs.add(new UdfMetadata(udfName, sqlUdf.description(), udfMethod.getValue(), udfConfig.subset(udfName + "."), params,
               udfMethod.getKey().returns(), udfMethod.getKey().disableArgumentCheck()));
         }
